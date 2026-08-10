@@ -18,14 +18,18 @@ from typing import Optional
 from config import SYMBOL, TIMEFRAME, BARS, MIN_CONFIDENCE, DEFAULT_RISK_REWARD
 from data.symbols import normalize_symbol
 from data.binance_client import BinanceClient
+from data.sample_client import maybe_client
 from engine.mtf import analyze_mtf, analyze_timeframe
 from engine.signal_engine import analyze_frame
 from output.signal_schema import validate_output
 import brain.context as context_mod
 from .calibrator import apply_calibration as _cal_apply
+from .calibrator import suggest_tp_rr_by_type
 from .state_memory import SignalMemory
 from .styles import classify_styles
 from .trading_intelligence import build_intelligence
+from .playbooks import primary_plan_types
+from .decision import build_decision
 
 
 def _load_calibration(db=None) -> dict:
@@ -37,6 +41,30 @@ def _load_calibration(db=None) -> dict:
         return {}
 
 
+def _eth_context(client: BinanceClient) -> dict:
+    """ETH playbook context: BTC 4H bias + ETH/BTC relative-strength slope.
+
+    Cheap and best-effort — every failure degrades to neutral so the pipeline
+    never breaks because a context feed is unreachable.
+    """
+    out = {"btc_bias": None, "eth_btc_slope": None}
+    try:
+        df_btc = client.klines("BTCUSDT", "4h", 120)
+        view = analyze_timeframe(df_btc, "4h")
+        out["btc_bias"] = view.get("trend")  # bull | bear | mixed
+    except Exception:
+        pass
+    try:
+        df_eb = client.klines("ETHBTC", "4h", 80)
+        if df_eb is not None and len(df_eb) > 20:
+            closes = df_eb["close"].astype(float).to_numpy()
+            slope = (closes[-1] / closes[-21] - 1) * 100.0
+            out["eth_btc_slope"] = round(float(slope), 3)
+    except Exception:
+        pass
+    return out
+
+
 def analyze_full(symbol: str = SYMBOL, timeframe: str = TIMEFRAME,
                  bars: int = BARS, client: Optional[BinanceClient] = None,
                  with_context: bool = True, with_memory: bool = True) -> dict:
@@ -44,7 +72,7 @@ def analyze_full(symbol: str = SYMBOL, timeframe: str = TIMEFRAME,
     signal, plans, snapshot, styles, mtf, context, memory, market_context,
     validation, analyzed_at."""
     symbol = normalize_symbol(symbol)
-    client = client or BinanceClient()
+    client = client or maybe_client()
     t0 = time.time()
 
     # 0) Fetch the execution-timeframe data ONCE and reuse it for both the
@@ -54,11 +82,14 @@ def analyze_full(symbol: str = SYMBOL, timeframe: str = TIMEFRAME,
     # 1) Multi-timeframe (parallel; skips re-fetching the execution TF)
     mtf = analyze_mtf(symbol, client, prefetched={timeframe: df})
 
-    # 2) single-frame engine (with calibration)
+    # 2) single-frame engine (with calibration + professional narrowing)
     calib = _load_calibration()
+    primary = primary_plan_types(symbol)          # decision A1
+    tp_rr = suggest_tp_rr_by_type(calib)          # decision A2 (data-driven TP)
     frame = analyze_frame(df, symbol=symbol, timeframe=timeframe,
                           min_confidence=MIN_CONFIDENCE,
-                          default_rr=DEFAULT_RISK_REWARD, calibration=calib)
+                          default_rr=DEFAULT_RISK_REWARD, calibration=calib,
+                          primary_types=primary, tp_rr_by_type=tp_rr)
     payload = frame.as_json()
     payload["market_context"] = client.market_context(symbol)
 
@@ -86,8 +117,24 @@ def analyze_full(symbol: str = SYMBOL, timeframe: str = TIMEFRAME,
         memory = mem_result
 
     # 6) professional desk-style intelligence report (strict filters:
-    #    confidence >=80, RR >=2, no major conflict/news risk)
+    #    confidence >=80, RR >= floor, no major conflict/news risk)
     payload["intelligence"] = build_intelligence(payload, df=df)
+
+    # 7) FINAL professional decision (decision A4): desk filter + per-asset
+    #    playbook (B1/B8) + portfolio/correlation veto (B2) + enforced risk &
+    #    discipline gate (B6/B7/B9/B10).  This is the only output you act on.
+    extra = {}
+    if symbol == "ETHUSDT":
+        extra = _eth_context(client)
+    df_1d = None
+    if symbol == "XAUUSD":
+        try:
+            df_1d = client.klines(symbol, "1d", 30)
+        except Exception:
+            df_1d = None
+    payload["decision"] = build_decision(payload, symbol, btc_bias=extra.get("btc_bias"),
+                                         eth_btc_slope=extra.get("eth_btc_slope"),
+                                         df_1d=df_1d)
 
     payload["validation"] = validate_output(payload)
     payload["analyzed_at"] = int(time.time() * 1000)

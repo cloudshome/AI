@@ -99,3 +99,17 @@ def test_run_backtest_shape(df):
     for g in result["graded"]:
         assert g.outcome in OUTCOMES
     assert report["summary"]["win_rate"] is None or 0 <= report["summary"]["win_rate"] <= 1
+
+
+def test_backtest_tags_regime(tmp_path):
+    """Decision B3: backtest rows carry the regime at signal time."""
+    from tests.conftest import make_ohlcv
+    df = make_ohlcv(n=300, seed=11)
+    out = run_backtest(df, symbol="BTCUSDT", timeframe="15m", horizons=[1.0],
+                       min_bars=150, step=5)
+    graded = out["graded"]
+    assert graded, "expected some graded plans"
+    assert any(g.regime for g in graded)
+    assert "by_regime" in out["report"]
+    rows = [g.as_row() for g in graded]
+    assert all("regime" in r for r in rows)

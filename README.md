@@ -86,7 +86,112 @@ Binance klines → add_all_indicators() → analyze_structure()
 
 ---
 
+## 🛡️ Professional operating mode (the roadmap, built-in)
+
+CryptoBrain now ships the discipline your professional roadmap demands —
+**desk-first, enforced risk, one tested edge at a time**. Everything is
+configurable via `.env`; defaults are conservative.
+
+| Decision | What it does | Control |
+|---|---|---|
+| **Desk-first** | Every scan ends in ONE `decision`: `TRADE BUY/SELL` or `WAIT — NO TRADE`. Desk-vetoed signals never enter the approval queue. Raw engine plans stay visible as research. | `DESK_DEFAULT=true` |
+| **One primary setup family** | Only your chosen family (default: liquidity sweep + trend continuation = Sweep Reversal + OB/FVG Pullback) may become the best signal; everything else is a watch-item until proven. | `PRIMARY_SETUP_FAMILY=sweep_trend_continuation` |
+| **Data-driven R:R** | TP targets come from measured per-setup expectancy (clamped 1.5–4.0R); the old fixed 2.0 gate is now a safety floor. | `TP_RR_MIN/MAX`, `INTELLIGENCE_MIN_RR=1.5` |
+| **Per-asset playbooks** | BTC 4H→1H→15M · ETH gated by BTC bias + ETH/BTC slope · GOLD D1→4H→1H/15M + PDH/PDL + London/NY sessions + US-data no-entry windows. | `brain/playbooks.py` |
+| **Correlation risk** | BTC+ETH = ONE crypto bucket: same-direction duplicates, full buckets and combined risk veto new trades; gold is tracked separately. | `CRYPTO_BUCKET_MAX_TRADES=2` |
+| **Enforced risk limits** | Daily limit → hard block; weekly → reduced activity; drawdown ladder −5%/−8%/−10%. Enforced at the approval button AND the paper runner (`--force` is the conscious override). | `ENFORCE_RISK_LIMITS=true` |
+| **Behavioral no-trade gate** | Angry / tired / revenge / chasing flags close the gate until cleared. | `python main.py tradestate --angry --note "..."` |
+| **Setup-proven gate** | A setup is PROVEN only after ≥100 backtest + ≥20 decided paper samples with positive expectancy; unproven = research-only at student/researcher levels. | `CALIBRATE_MIN_N=100` |
+| **Regime-tagged learning** | Every backtest/paper trade records its market regime; calibration works per `setup × regime`, stats report per regime. | `python main.py stats` |
+| **Business scorecard** | Win rate, avg win/loss, expectancy, profit factor, max drawdown, streaks, rolling 50/100 windows, execution-violation rate. | `python main.py stats` |
+| **Professional journal** | Post-trade fields with "did I follow my system?" as the headline; MAE/MFE recorded per paper trade. | `python main.py journal <scan_id> --followed-rules 1 ...` |
+
+New CLI:
+
+```bash
+python main.py risk          # gate status: daily/weekly/drawdown/progression
+python main.py tradestate --angry --note "tilted"   # close the gate
+python main.py tradestate --clear                   # open it again
+python main.py journal <scan_id> --followed-rules 1 --emotion calm --mistake none
+python main.py journal        # discipline summary (violation rate)
+python main.py sourcetrust discord_group 5 0.3 --note "private signals: context only"
+python main.py health         # system health: data feeds, DB, risk gate, MCP, LLM
+python main.py brief          # daily desk briefing (alias for `agent morning`)
+python main.py agent morning  # desk morning briefing across BTC/ETH/GOLD
+python main.py agent ask "is the risk gate open?"   # natural-language question
+python main.py agent ask "am i ready for micro?"    # the graduation gate
+python main.py agent all      # one desk run: health + briefing + graduation
+python main.py simulator      # grind unique 100-backtest / 20-paper samples per setup
+python main.py mcp            # MCP server for Claude Desktop / Cursor (stdio)
+```
+
+Progression levels (`PROGRESSION=student|researcher|simulator|micro|consistent|scale`)
+map to your Phase-18 ladder and change risk caps + whether unproven setups
+can be approved. Start at `simulator` (BLUEPRINT Step 1) and paper-trade the
+100–200 sample dataset that proves your setups; promote to `micro` only when
+the **graduation gate** passes (see `BLUEPRINT.md`).
+
+#### Desk agent (`agent`, `health`)
+
+* `python main.py agent morning` — one briefing for the whole watchlist: every
+  asset with its final **desk decision** (desk-first), playbook + regime,
+  risk-gate state, pending reviews, open exposure and paper-book stats, plus a
+  plain-English narrative. `--save` also persists each scan.
+* `python main.py agent ask "..."` — intent-based answers from live engine +
+  DB state: risk gate, exposure, pending queue, journal discipline,
+  calibration, stats, paper book, market scan, sources, progression, and the
+  **graduation gate** (`"am i ready for micro?"`) — the BLUEPRINT Step 2→3
+  checklist: expectancy ≥ +0.50R, win rate > 55%, profit factor ≥ 1.5,
+  rule compliance ≥ 90%, plus the 100/20 sample proof.
+* `python main.py agent all` — one desk run: health report + morning
+  briefing + graduation gate (`--json` for the full machine-readable blob).
+* `python main.py brief` — the daily briefing (alias for `agent morning`).
+* `python main.py health` — probe every data feed per symbol, DB integrity,
+  risk gate, learning store, MCP + LLM availability; exits non-zero on failure.
+  In live mode it also cross-checks Binance prices against **KuCoin + OKX**
+  public APIs and flags deviations > 1%.
+  The dashboard renders the same report (`/api/health`) and the morning
+  briefing (`/api/agents`), and `/api/ask` exposes the question desk.
+
+#### Paper-sample grind (`simulator`)
+
+`python main.py simulator` walks history with the engine, grades every plan
+forward (SL/TP touch logic on real bars), and stores **unique** samples —
+re-simulating the same window never double-counts.  It produces both halves of
+the setup-proven proof (decisions A6/B10):
+
+* backtest samples (`sim_key`-deduped rows in `backtest_results`), and
+* decided paper samples (created-and-closed `paper_trades` rows with
+  TP_HIT/STOP_LOSS outcomes + regime).
+
+The progress table shows each setup against the 100-backtest / 20-paper /
+positive-expectancy targets and tells you when the primary setup family is
+ready for `PROGRESSION=micro`.  Below it, the **graduation gate** prints the
+four BLUEPRINT criteria (expectancy / win rate / profit factor / rule
+compliance) with the exact numbers — `simulator --json` includes them too.
+Offline it runs on the committed sample + deterministic synthetic data
+(`DEMO_MODE=1`).
+
+> Note: simulator walk-forward samples count as **calibration evidence**
+> (setup-proof, graduation gate) but are excluded from the **live risk book**
+> — daily/weekly loss limits, the drawdown ladder and the business scorecard
+> only see real paper trades (`decided_paper_rows(exclude_sim=True)`).
+
+#### MCP server (`mcp`)
+
+`python main.py mcp` exposes the desk to Claude Desktop / Cursor / any MCP
+client over stdio (10 tools: health, morning briefing, scan, desk report,
+risk gate, ask, pending, stats, paper, learn).  Add to your MCP client config:
+
+```json
+{ "mcpServers": { "cryptobrain": {
+    "command": "python", "args": ["main.py", "mcp"], "cwd": "/path/to/AI" } } }
+```
+
+---
+
 ## 🚀 Quickstart
+
 
 ```bash
 # 1. install
@@ -561,17 +666,28 @@ crypto-brain/
 
 ---
 
+## 👤 Ownership
+
+| | |
+|---|---|
+| **Owner** | [Cloudslover](https://github.com/Cloudslover) |
+| **Canonical repo** | https://github.com/Cloudslover/AI |
+| **Companion dashboard** | https://github.com/Cloudslover/CryptoDashboard |
+| **Upstream reference** | https://github.com/cloudshome/AI (read-only history source) |
+
 ## 📤 Publishing to GitHub
 
-The repo is git-initialised and committed locally. To publish:
-
 ```bash
-cd crypto-brain
-git remote add origin https://github.com/YOUR_USERNAME/crypto-brain.git
+# Create an empty public repo named "AI" under Cloudslover, then:
+cd AI
+git remote add origin https://github.com/Cloudslover/AI.git   # already set in this workspace
 git push -u origin main
 ```
 
-(or create a repo on GitHub first — empty, no README — then run the two lines above.)
+This workspace is pre-wired:
+
+* `origin`   → `https://github.com/Cloudslover/AI.git` (push target)
+* `upstream` → `https://github.com/cloudshome/AI.git` (pull latest reference code)
 
 ---
 

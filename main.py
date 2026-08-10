@@ -9,6 +9,14 @@ Usage:
   python main.py web                                         # dashboard
   python main.py paper --watch                               # live-market paper monitor
   python main.py sources                                     # CryptoDada + Discord + news
+  python main.py brief                                       # daily desk briefing (alias)
+  python main.py agent morning                               # desk morning briefing
+  python main.py agent ask "is the risk gate open?"          # natural-language question
+  python main.py agent ask "am i ready for micro?"           # graduation gate
+  python main.py agent all                                   # health + briefing + graduation
+  python main.py health                                      # system health (+ KuCoin/OKX cross-check)
+  python main.py simulator                                   # grind 100/20 sample proof
+  python main.py mcp                                         # MCP server for Claude/Cursor
 """
 from __future__ import annotations
 
@@ -26,13 +34,14 @@ from config import (SYMBOL, SYMBOLS, TIMEFRAME, BARS, MIN_CONFIDENCE, DEFAULT_RI
 
 from data.symbols import normalize_symbol, parse_symbol_list
 from data.binance_client import BinanceClient
+from data.sample_client import maybe_client
 from engine.signal_engine import analyze_frame
 from output.signal_schema import validate_output
 from output.notifiers import notify_all
 
 
 def _client() -> BinanceClient:
-    return BinanceClient()
+    return maybe_client()
 
 
 def _sym(value: str | None) -> str:
@@ -74,6 +83,11 @@ def run_scan(symbol: str, timeframe: str, bars: int, with_context: bool = True,
         from engine.lifecycle import reviewable
         with SignalDB() as db:
             sig = payload.get("signal", {})
+            decision = payload.get("decision") or {}
+            # Desk-first (decision A4): a signal the desk vetoed never enters
+            # the human approval queue — it is recorded as a research scan.
+            desk_ok = decision.get("action") in ("BUY", "SELL")
+            status_override = None if desk_ok else "CREATED"
             existing = db.conn.execute(
                 "SELECT id, status FROM scans WHERE signal_id=?",
                 (sig.get("signal_id"),)).fetchone()
@@ -81,10 +95,10 @@ def run_scan(symbol: str, timeframe: str, bars: int, with_context: bool = True,
                 scan_id = existing["id"]
                 status = existing["status"]
             else:
-                scan_id = db.save_scan(payload)
-                status = "PENDING_REVIEW" if reviewable(sig) else "CREATED"
+                scan_id = db.save_scan(payload, status_override=status_override)
+                status = "PENDING_REVIEW" if reviewable(sig) and desk_ok else "CREATED"
             payload["scan_id"] = scan_id
-            if auto_approve and reviewable(sig):
+            if auto_approve and reviewable(sig) and desk_ok:
                 db.update_status(scan_id, "APPROVED", note="auto-approve", reviewer="auto")
                 payload["lifecycle"] = {"status": "APPROVED",
                                         "note": "auto-approved (--auto-approve)"}
@@ -93,7 +107,11 @@ def run_scan(symbol: str, timeframe: str, bars: int, with_context: bool = True,
                     "status": status,
                     "note": ("awaiting human approval — `python main.py review`"
                              if status == "PENDING_REVIEW" else
-                             "monitor-only signal (no action required)"),
+                             "monitor-only signal (no action required)" if status == "CREATED"
+                             and not decision.get("blocked_by") else
+                             "DESK BLOCKED — " + "; ".join(decision.get("blocked_by", []))
+                             if status == "CREATED" and decision.get("blocked_by") else
+                             f"current state: {status}"),
                 }
     return payload
 
@@ -118,13 +136,35 @@ def cmd_scan(args) -> int:
 
 def _print_human(payload: dict) -> None:
     sig = payload["signal"]
+    decision = payload.get("decision") or {}
     print("=" * 72)
-    print(f"{sig['action']:>10}  {sig['asset']}  [{sig['timeframe']}]  "
-          f"conf={sig['confidence']:<7} {sig['signal_id']}")
+    d = decision.get("action", sig.get("action"))
+    if d != sig.get("action"):
+        print(f"{'NO TRADE':>10}  {sig['asset']}  [{sig['timeframe']}]  "
+              f"conf={sig['confidence']:<7} {sig['signal_id']}   ← DESK VETOED engine {sig['action']}")
+        for b in decision.get("blocked_by", []):
+            print(f"   ✗ {b}")
+    else:
+        print(f"{sig['action']:>10}  {sig['asset']}  [{sig['timeframe']}]  "
+              f"conf={sig['confidence']:<7} {sig['signal_id']}")
     if sig.get("entry"):
         print(f"   entry {sig['entry']:>12,.2f}   SL {sig['stop_loss']:>10,.2f}   "
               f"TP {sig['take_profit']:>12,.2f}   RR {sig['risk_reward']:.2f}")
     print(f"   reason: {sig['reason']}")
+    if decision:
+        gates = decision.get("gates") or {}
+        play = gates.get("playbook") or {}
+        if play.get("name"):
+            print(f"   playbook: {play['name']} — {play.get('note', '')}")
+        for c in play.get("checks", []):
+            mark = "✓" if c.get("ok") else ("✗" if c.get("blocking") else "·")
+            print(f"     {mark} {c['detail']}")
+        rg = gates.get("risk") or {}
+        for b in rg.get("blocked_by", []):
+            print(f"     ✗ risk: {b}")
+        pv = gates.get("portfolio") or {}
+        for r in pv.get("reasons", []):
+            print(f"     ✗ portfolio: {r}")
 
     # Styles summary (what the market is offering)
     styles = payload.get("styles") or {}
@@ -223,6 +263,17 @@ def cmd_sources(args) -> int:
     result["discord"] = summarize_discord(dr.read_all()) if dr.can_read else {
         "configured": False, "message": "Set DISCORD_TOKEN + DISCORD_CHANNEL_IDS in .env"}
     result["news"] = fetch_news(limit=12)
+    # Information hierarchy (decision A5): tier + trust per source.
+    from data.database import SignalDB
+    from config import SOURCE_TIER_NAMES
+    with SignalDB() as db:
+        result["source_trust"] = [
+            {**s, "tier_name": SOURCE_TIER_NAMES.get(s["tier"], "?")}
+            for s in db.load_source_scores()]
+    if not result["source_trust"]:
+        result["source_trust_note"] = (
+            "No source scores yet — `python main.py sourcetrust <source> <tier 1-5> <0-1> "
+            "[note]` (tier 5 = private signals, never auto-actionable)")
     print(json.dumps(result, indent=2, default=str))
     return 0
 
@@ -294,7 +345,29 @@ def _decide(args, to_state: str) -> int:
 
 
 def cmd_approve(args) -> int:
-    return _decide(args, "APPROVED")
+    """Human approval — but the risk & discipline gate is ENFORCED here
+    (decisions B6/B7/B9/B10).  `--force` is the explicit escape hatch."""
+    from data.database import SignalDB
+    from brain.risk_gate import evaluate as gate_evaluate, gate_message
+    from data.paper_trading import _primary_plan
+    with SignalDB() as db:
+        scan = db.get_scan(args.scan_id)
+        if scan is None:
+            print(f"[!] scan #{args.scan_id} not found", file=sys.stderr)
+            return 1
+        plan_type = _primary_plan(scan).get("type")
+        gate = gate_evaluate(db, symbol=scan.get("symbol"), plan_type=plan_type,
+                             action=scan.get("action"))
+    if not gate["allowed"] and not args.force:
+        print("[!] Approval blocked by the risk & discipline gate.", file=sys.stderr)
+        for b in gate["blocked_by"]:
+            print(f"    ✗ {b}", file=sys.stderr)
+        print("    (re-run with --force to override consciously)", file=sys.stderr)
+        return 2
+    rc = _decide(args, "APPROVED")
+    if rc == 0 and not gate["allowed"]:
+        print(f"    ⚠️ overridden with --force: {gate_message(gate)}")
+    return rc
 
 
 def cmd_reject(args) -> int:
@@ -659,6 +732,35 @@ def cmd_stats(args) -> int:
               f"{f'{wr*100:.1f}%' if wr is not None else 'n/a'} | avgR {p['avg_rr']}")
     else:
         print("  none yet — approve a signal, then run `python main.py paper --watch`.")
+
+    # Business scorecard (decision B4) + regime learning (B3) + journal (B5)
+    try:
+        from brain.metrics import business_metrics, format_metrics
+        with SignalDB() as db:
+            metrics = business_metrics(db)
+            print()
+            print(format_metrics(metrics))
+    except Exception as exc:  # never break stats on a metrics hiccup
+        print(f"  (business metrics unavailable: {exc})")
+
+    if bt.get("by_regime"):
+        print("-" * 66)
+        print("BACKTEST learning by regime (strategy = setup × regime × asset):")
+        for r in bt["by_regime"]:
+            wr = r["win_rate"]
+            print(f"  {r['regime'] or 'UNKNOWN':<22} n={r['n']:>4} win "
+                  f"{f'{wr*100:.1f}%' if wr is not None else 'n/a'}  avgR {r['avg_rr']}")
+
+    try:
+        from brain.journal import violation_rate
+        with SignalDB() as db:
+            j = violation_rate(db)
+        if j["n"]:
+            print("-" * 66)
+            print(f"JOURNAL discipline: {j['violations']}/{j['n']} trades "
+                  f"({j['violation_rate']*100:.1f}%) violated the system")
+    except Exception:
+        pass
     return 0
 
 
@@ -668,6 +770,227 @@ def cmd_web(args) -> int:
     port = args.port or DASHBOARD_PORT
     serve(make_app(), host, port)
     return 0
+
+
+def cmd_sourcetrust(args) -> int:
+    """Record/update a source's information tier (1-5) and trust (0-1)
+    (decision A5).  Tier 5 = private signals: context only, never a trigger."""
+    from data.database import SignalDB
+    from config import SOURCE_TIER_NAMES
+    with SignalDB() as db:
+        db.save_source_score(args.source, args.tier, args.trust, note=args.note or "")
+        rows = db.load_source_scores()
+    print("source trust table:")
+    for s in rows:
+        print(f"  {s['source']:<22} tier {s['tier']} ({SOURCE_TIER_NAMES.get(s['tier'], '?')})  "
+              f"trust {s['trust']:.2f}  {s['note'] or ''}")
+    return 0
+
+
+def cmd_risk(args) -> int:
+    """Risk & discipline gate status: daily/weekly limits, drawdown ladder,
+    trader state, progression level (decisions B6/B7/B9/B10)."""
+    from brain.risk_gate import status_text
+    from data.database import SignalDB
+    with SignalDB() as db:
+        print(status_text(db))
+    return 0
+
+
+def cmd_tradestate(args) -> int:
+    """Set/clear the behavioral no-trade flags (decision B7)."""
+    from data.database import SignalDB
+    from brain.risk_gate import trader_state_blocked
+    with SignalDB() as db:
+        if any(v is not None for v in (args.angry, args.tired, args.revenge, args.chasing)) \
+                or args.clear or args.note:
+            if args.clear:
+                db.set_trader_state(angry=False, tired=False, revenge=False,
+                                    chasing=False, note=args.note or "cleared")
+            else:
+                db.set_trader_state(angry=args.angry, tired=args.tired,
+                                    revenge=args.revenge, chasing=args.chasing,
+                                    note=args.note or "")
+            print("trader state updated:")
+        st = db.get_trader_state()
+        g = trader_state_blocked(db)
+    for k in ("angry", "tired", "revenge", "chasing"):
+        print(f"  {k:<8} {'✗ BLOCKED' if st.get(k) else 'clear'}")
+    if st.get("note"):
+        print(f"  note: {st['note']}")
+    print(f"  gate: {'CLOSED — no new trades until cleared' if g['blocked'] else 'OPEN'}")
+    return 0
+
+
+def cmd_journal(args) -> int:
+    """Professional trading journal (decision B5): record/view post-trade
+    fields and execution quality for a closed scan."""
+    from brain.journal import (save_journal, get_journal, execution_quality,
+                               pre_trade_checklist, describe_entry,
+                               violation_rate)
+    from data.database import SignalDB
+    with SignalDB() as db:
+        if args.scan_id is not None:
+            if args.followed_rules is not None or args.emotion or args.mistake \
+                    or args.screenshot or args.would_change or args.notes:
+                entry = save_journal(
+                    db, args.scan_id,
+                    followed_rules=args.followed_rules,
+                    emotion=args.emotion, mistake=args.mistake,
+                    screenshot_path=args.screenshot, would_change=args.would_change,
+                    notes=args.notes)
+                print(f"journal saved for scan #{args.scan_id}:")
+                print(describe_entry(entry))
+                q = execution_quality(db, args.scan_id)
+                if q.get("recorded"):
+                    print(f"  → {q['verdict']} (quality {q['quality']}, {q['outcome_r']:+.2f}R)")
+            else:
+                entry = get_journal(db, args.scan_id)
+                print(f"journal for scan #{args.scan_id}:")
+                print(describe_entry(entry))
+                q = execution_quality(db, args.scan_id)
+                if q.get("recorded"):
+                    print(f"  → {q['verdict']} (quality {q['quality']})")
+        else:
+            stats = violation_rate(db)
+            print("=" * 66)
+            print("JOURNAL — execution discipline")
+            print(f"  recorded trades   {stats['n']}")
+            if stats["n"]:
+                print(f"  rule violations   {stats['violations']} "
+                      f"({stats['violation_rate']*100:.1f}%)")
+                print("  (the goal is 0% — a loss with rules followed is an excellent trade)")
+            else:
+                print("  none yet — `python main.py journal <scan_id> --followed-rules 1 ...`")
+    return 0
+
+
+def cmd_agent(args) -> int:
+    """Desk agent: morning briefing / health / natural-language ask / all."""
+    from brain.agent import (ask, format_answer, format_briefing, format_health,
+                             health_report, morning_briefing)
+    if args.action == "morning":
+        briefing = morning_briefing(symbols=args.symbols, timeframe=args.tf,
+                                    bars=args.bars, save=args.save)
+        if args.json:
+            print(json.dumps(briefing, indent=2, default=str))
+        else:
+            print(format_briefing(briefing))
+        return 0
+    if args.action == "health":
+        report = health_report()
+        if args.json:
+            print(json.dumps(report, indent=2, default=str))
+        else:
+            print(format_health(report))
+        return 0
+    if args.action == "ask":
+        result = ask(args.question, symbol=args.symbol, timeframe=args.tf,
+                     bars=args.bars)
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            print(format_answer(result))
+        return 0
+    if args.action == "all":
+        # One desk run: health + morning briefing + graduation gate.
+        from brain.agent import graduation_report
+        from data.simulator import format_graduation
+        report = health_report()
+        briefing = morning_briefing(symbols=args.symbols, timeframe=args.tf,
+                                    bars=args.bars, save=args.save)
+        gate = graduation_report()
+        if args.json:
+            print(json.dumps({"health": report, "briefing": briefing,
+                              "graduation": gate}, indent=2, default=str))
+        else:
+            print(format_health(report))
+            print()
+            print(format_briefing(briefing))
+            print()
+            print(format_graduation(gate["graduation"]))
+        return 0
+    print(f"[!] unknown agent action: {args.action}", file=sys.stderr)
+    return 1
+
+
+def cmd_brief(args) -> int:
+    """Daily desk briefing — alias for `agent morning` (BLUEPRINT ready-to-run)."""
+    from brain.agent import format_briefing, morning_briefing
+    briefing = morning_briefing(symbols=args.symbols, timeframe=args.tf,
+                                bars=args.bars, save=args.save)
+    if args.json:
+        print(json.dumps(briefing, indent=2, default=str))
+    else:
+        print(format_briefing(briefing))
+    return 0
+
+
+def cmd_health(args) -> int:
+    """System health: data feeds, database, risk gate, learning, MCP, LLM."""
+    from brain.agent import format_health, health_report
+    report = health_report()
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+    else:
+        print(format_health(report))
+    return 0 if report.get("ok") else 1
+
+
+def cmd_simulator(args) -> int:
+    """The paper-sample grind: unique backtest + paper samples per setup."""
+    from data.database import SignalDB
+    from data.simulator import (format_graduation, format_progress,
+                                graduation_status, grind_verdict,
+                                paper_progress, simulate_round)
+
+    symbols = _symbols(args.symbols) if args.symbols else None
+    total_bt = total_pp = 0
+    rounds = []
+    for r in range(max(1, args.rounds)):
+        res = simulate_round(symbols=symbols, timeframe=args.tf, bars=args.bars,
+                             step=args.step, min_confidence=args.min_conf,
+                             horizons=[float(h) for h in args.horizons.split(",") if h],
+                             save=not args.dry_run)
+        rounds.append(res)
+        total_bt += res["backtest_added"]
+        total_pp += res["paper_added"]
+        if not args.json:
+            for s in res["symbols"]:
+                if s.get("error"):
+                    print(f"[!] {s['symbol']}: {s['error']}", file=sys.stderr)
+            print(f"round {r + 1}: +{res['backtest_added']} backtest samples, "
+                  f"+{res['paper_added']} paper samples (run {res['run_id']})")
+        if args.dry_run:
+            break  # dry-run: one pass, nothing stored
+
+    with SignalDB() as db:
+        progress = paper_progress(db)
+        verdict = grind_verdict(progress)
+        from brain.journal import violation_rate
+        j = violation_rate(db)
+        compliance = 1.0 - j["violation_rate"] if j["violation_rate"] is not None \
+            else None
+        gate = graduation_status(progress, compliance=compliance)
+    if args.json:
+        print(json.dumps({"rounds": rounds, "totals": {"backtest_added": total_bt,
+                                                       "paper_added": total_pp},
+                          "progress": progress, "verdict": verdict,
+                          "graduation": gate, "journal": j},
+                         indent=2, default=str))
+    else:
+        print()
+        print(format_progress(progress, verdict))
+        print()
+        print(format_graduation(gate))
+        print("\n(dry-run: nothing was stored)" if args.dry_run else "")
+    return 0
+
+
+def cmd_mcp(args) -> int:
+    """Run the Model Context Protocol server (stdio) for MCP clients."""
+    from ai.mcp_server import run as mcp_run
+    return mcp_run()
 
 
 def main() -> int:
@@ -728,9 +1051,11 @@ def main() -> int:
     p_rev.add_argument("--symbol", default=None, help="optional asset filter (BTC, ETH, XAU/GOLD)")
     p_rev.set_defaults(func=cmd_review)
 
-    p_app = sub.add_parser("approve", help="approve a pending signal")
+    p_app = sub.add_parser("approve", help="approve a pending signal (risk gate enforced)")
     p_app.add_argument("scan_id", type=int)
     p_app.add_argument("--note", default="")
+    p_app.add_argument("--force", action="store_true",
+                       help="override a closed risk gate consciously")
     p_app.set_defaults(func=cmd_approve)
 
     p_rej = sub.add_parser("reject", help="reject a pending signal")
@@ -793,10 +1118,101 @@ def main() -> int:
     p_st.add_argument("--tf", default=TIMEFRAME)
     p_st.set_defaults(func=cmd_state)
 
+    p_risk = sub.add_parser("risk", help="risk & discipline gate status (daily/weekly/drawdown/progression)")
+    p_risk.set_defaults(func=cmd_risk)
+
+    p_st2 = sub.add_parser("sourcetrust", help="record a source's information tier (1-5) + trust (0-1)")
+    p_st2.add_argument("source")
+    p_st2.add_argument("tier", type=int, choices=(1, 2, 3, 4, 5))
+    p_st2.add_argument("trust", type=float)
+    p_st2.add_argument("--note", default="")
+    p_st2.set_defaults(func=cmd_sourcetrust)
+
+    p_ts = sub.add_parser("tradestate", help="set/clear behavioral no-trade flags (angry/tired/revenge/chasing)")
+    p_ts.add_argument("--angry", action="store_true", default=None)
+    p_ts.add_argument("--tired", action="store_true", default=None)
+    p_ts.add_argument("--revenge", action="store_true", default=None)
+    p_ts.add_argument("--chasing", action="store_true", default=None)
+    p_ts.add_argument("--clear", action="store_true", help="clear all flags")
+    p_ts.add_argument("--note", default="")
+    p_ts.set_defaults(func=cmd_tradestate)
+
+    p_j = sub.add_parser("journal", help="professional trading journal (post-trade fields + execution quality)")
+    p_j.add_argument("scan_id", nargs="?", type=int, default=None)
+    p_j.add_argument("--followed-rules", type=int, choices=(0, 1), default=None,
+                     help="1 = followed the system, 0 = broke the rules (the headline field)")
+    p_j.add_argument("--emotion", default="", help="calm/anxious/euphoric/fearful/frustrated/greedy/...")
+    p_j.add_argument("--mistake", default="")
+    p_j.add_argument("--screenshot", default="", help="path to chart screenshot")
+    p_j.add_argument("--would-change", default="")
+    p_j.add_argument("--notes", default="")
+    p_j.set_defaults(func=cmd_journal)
+
     p_web = sub.add_parser("web", help="run the web dashboard")
     p_web.add_argument("--host", default=None)
     p_web.add_argument("--port", type=int, default=None)
     p_web.set_defaults(func=cmd_web)
+
+    p_agent = sub.add_parser("agent", help="desk agent: morning, health, ask, all")
+    p_agent.set_defaults(func=cmd_agent)
+    a_sub = p_agent.add_subparsers(dest="action", required=True)
+    p_morning = a_sub.add_parser("morning", help="morning briefing across the watchlist")
+    p_morning.add_argument("--symbols", default=None,
+                           help="comma-separated watchlist (default: BTCUSDT,ETHUSDT,XAUUSD)")
+    p_morning.add_argument("--tf", default=TIMEFRAME)
+    p_morning.add_argument("--bars", type=int, default=BARS)
+    p_morning.add_argument("--save", action="store_true",
+                           help="also persist each scan to the signal database")
+    p_morning.add_argument("--json", action="store_true")
+    p_health_a = a_sub.add_parser("health", help="system health report")
+    p_health_a.add_argument("--json", action="store_true")
+    p_ask_a = a_sub.add_parser("ask", help="ask the desk a natural-language question")
+    p_ask_a.add_argument("question")
+    p_ask_a.add_argument("--symbol", default=None, help="asset context (BTC, ETH, GOLD)")
+    p_ask_a.add_argument("--tf", default=TIMEFRAME)
+    p_ask_a.add_argument("--bars", type=int, default=BARS)
+    p_ask_a.add_argument("--json", action="store_true")
+    p_all_a = a_sub.add_parser("all", help="one desk run: health + briefing + graduation")
+    p_all_a.add_argument("--symbols", default=None,
+                         help="comma-separated watchlist (default: BTCUSDT,ETHUSDT,XAUUSD)")
+    p_all_a.add_argument("--tf", default=TIMEFRAME)
+    p_all_a.add_argument("--bars", type=int, default=BARS)
+    p_all_a.add_argument("--save", action="store_true",
+                         help="also persist each scan to the signal database")
+    p_all_a.add_argument("--json", action="store_true")
+
+    p_brief = sub.add_parser("brief", help="daily desk briefing (alias for `agent morning`)")
+    p_brief.add_argument("--symbols", default=None,
+                         help="comma-separated watchlist (default: BTCUSDT,ETHUSDT,XAUUSD)")
+    p_brief.add_argument("--tf", default=TIMEFRAME)
+    p_brief.add_argument("--bars", type=int, default=BARS)
+    p_brief.add_argument("--save", action="store_true",
+                         help="also persist each scan to the signal database")
+    p_brief.add_argument("--json", action="store_true")
+    p_brief.set_defaults(func=cmd_brief)
+
+    p_health = sub.add_parser("health", help="system health (data feeds, DB, risk gate, MCP)")
+    p_health.add_argument("--json", action="store_true")
+    p_health.set_defaults(func=cmd_health)
+
+    p_sim = sub.add_parser("simulator",
+                           help="grind unique backtest + paper samples per setup (A6/B10)")
+    p_sim.add_argument("--rounds", type=int, default=1, help="rounds to run (default 1)")
+    p_sim.add_argument("--symbols", default=None,
+                       help="comma-separated watchlist (default: BTCUSDT,ETHUSDT,XAUUSD)")
+    p_sim.add_argument("--tf", default=TIMEFRAME)
+    p_sim.add_argument("--bars", type=int, default=600, help="history bars per symbol")
+    p_sim.add_argument("--step", type=int, default=3, help="window step (1 = every bar)")
+    p_sim.add_argument("--min-conf", type=int, default=MIN_CONFIDENCE)
+    p_sim.add_argument("--horizons", default="1,4,24",
+                       help="comma-separated forward horizons in hours")
+    p_sim.add_argument("--dry-run", action="store_true",
+                       help="compute what WOULD be added without storing anything")
+    p_sim.add_argument("--json", action="store_true")
+    p_sim.set_defaults(func=cmd_simulator)
+
+    p_mcp = sub.add_parser("mcp", help="run the Model Context Protocol server (stdio)")
+    p_mcp.set_defaults(func=cmd_mcp)
 
     args = ap.parse_args()
     if args.cmd == "scan" and args.symbols is None:
@@ -809,7 +1225,9 @@ def main() -> int:
         print(f"   open  http://localhost:{DASHBOARD_PORT}   (watch + click approve/reject)")
         print("   everything runs from the dashboard — no commands needed")
         print("   advanced/automation: scan | intelligence | watch | paper | analyze | backtest |")
-        print("                        learn | stats | coach | review | sources | state | glossary")
+        print("                        learn | stats | coach | review | sources | state | glossary |")
+        print("                        brief | agent (morning/health/ask/all) | health |")
+        print("                        simulator | mcp")
         print("=" * 62)
         serve(make_app(), DASHBOARD_HOST, DASHBOARD_PORT)
         return 0

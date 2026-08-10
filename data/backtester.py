@@ -50,6 +50,7 @@ class GradedPlan:
     rr_achieved: float = 0.0
     max_favorable: float = 0.0
     max_adverse: float = 0.0
+    regime: str = ""   # market regime at signal time (decision B3)
 
     def as_row(self) -> dict:
         return {
@@ -58,10 +59,12 @@ class GradedPlan:
             "trigger_level": self.trigger_level, "horizon_hours": self.horizon_hours,
             "outcome": self.outcome, "rr_achieved": self.rr_achieved,
             "max_favorable": self.max_favorable, "max_adverse": self.max_adverse,
+            "regime": self.regime,
         }
 
 
-def _evaluate(plan: dict, df: pd.DataFrame, i: int, horizon_bars: int) -> GradedPlan:
+def _evaluate(plan: dict, df: pd.DataFrame, i: int, horizon_bars: int,
+              regime: str = "") -> GradedPlan:
     """Grade one plan produced at bar i over `horizon_bars` future bars."""
     entry = plan.get("entry")
     sl = plan.get("stop_loss")
@@ -77,6 +80,7 @@ def _evaluate(plan: dict, df: pd.DataFrame, i: int, horizon_bars: int) -> Graded
         entry=entry, trigger_level=plan.get("trigger_level"),
         horizon_hours=round(horizon_bars * TIMEFRAME_TO_MS.get(
             df.attrs.get("timeframe", "15m"), 900_000) / 3_600_000, 2),
+        regime=regime,
     )
     if entry is None or sl is None or tp1 is None:
         gp.outcome = "NOT_TRIGGERED"
@@ -200,10 +204,11 @@ def run_backtest(df: pd.DataFrame, symbol: str = "BTCUSDT", timeframe: str = "15
             continue
         scans_done += 1
         plans_total += len(plans)
+        regime = (out.features or {}).get("regime_name", "")
         for h in horizons:
             horizon_bars = max(1, int(h * 3_600_000 / tf_ms))
             for plan in plans:
-                all_graded.append(_evaluate(plan, df, i, horizon_bars))
+                all_graded.append(_evaluate(plan, df, i, horizon_bars, regime=regime))
 
     report = {
         "meta": {
@@ -227,6 +232,7 @@ def run_backtest(df: pd.DataFrame, symbol: str = "BTCUSDT", timeframe: str = "15
             lambda g: "HIGH" if g.confidence_pct >= 80
                       else "MEDIUM" if g.confidence_pct >= 60 else "LOW",
         ),
+        "by_regime": group_by(all_graded, lambda g: g.regime or "UNKNOWN"),
     }
     return {"report": report, "graded": all_graded}
 
@@ -265,5 +271,12 @@ def print_report(report: dict) -> None:
     for c, agg in report["by_confidence"].items():
         wr = agg["win_rate"]
         print(f"  {c:<8} exec {agg['executed']:>4}  win "
+              f"{f'{wr*100:.1f}%' if wr is not None else 'n/a'}  "
+              f"avgR {agg['avg_rr']}  exp {agg['expectancy']}")
+    print("by regime (decision B3 — strategy = setup × regime × asset):")
+    for r, agg in sorted(report.get("by_regime", {}).items(),
+                         key=lambda kv: -(kv[1]["executed"] or 0)):
+        wr = agg["win_rate"]
+        print(f"  {r:<22} exec {agg['executed']:>4}  win "
               f"{f'{wr*100:.1f}%' if wr is not None else 'n/a'}  "
               f"avgR {agg['avg_rr']}  exp {agg['expectancy']}")

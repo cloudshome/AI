@@ -61,3 +61,41 @@ def test_output_has_plans_and_snapshot(df):
     assert "plans" in payload and "snapshot" in payload
     assert "features" in payload["snapshot"]
     assert "scores" in payload["snapshot"]
+
+
+def test_regime_tagged_features(df):
+    """Decision B3: every frame is regime-tagged."""
+    out = analyze_frame(df, symbol="BTCUSDT", timeframe="15m", min_confidence=0)
+    f = out.features
+    assert "regime_name" in f and f["regime_name"]
+    assert "regime_label" in f and "regime" in f
+    assert f["regime"]["regime"] == f["regime_name"]
+
+
+def test_primary_narrowing(df):
+    """Decision A1: outside the family, plans are watch-items and cannot
+    become the best signal."""
+    out_all = analyze_frame(df, symbol="BTCUSDT", timeframe="15m", min_confidence=0)
+    out_narrow = analyze_frame(df, symbol="BTCUSDT", timeframe="15m", min_confidence=0,
+                               primary_types={"Buy Pullback", "Sell Pullback"})
+    assert any(p["primary"] for p in out_all.plans)
+    for p in out_narrow.plans:
+        assert p["primary"] == (p["type"] in {"Buy Pullback", "Sell Pullback"})
+    # when narrowing is active the best signal always comes from a primary plan
+    best = out_narrow.best_signal
+    if best["action"] in ("BUY", "SELL") and best.get("entry"):
+        primaries = [p for p in out_narrow.plans if p["primary"]]
+        assert any(abs(float(p.get("entry") or 0) - float(best["entry"])) < 1e-6
+                   for p in primaries)
+
+
+def test_tp_rr_by_type(df):
+    """Decision A2: per-setup TP distance in R from measured expectancy."""
+    out = analyze_frame(df, symbol="BTCUSDT", timeframe="15m", min_confidence=0,
+                        tp_rr_by_type={"Buy Pullback": 3.0})
+    for p in out.plans:
+        if p["type"] == "Buy Pullback" and p.get("entry") and p.get("stop_loss"):
+            risk = abs(p["entry"] - p["stop_loss"])
+            tp1 = p["take_profits"][0]
+            assert tp1 > p["entry"]  # BUY
+            assert round((tp1 - p["entry"]) / risk, 2) == 3.0
