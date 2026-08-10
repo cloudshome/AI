@@ -41,11 +41,12 @@ jobs:
           node --check /tmp/dash.js
 
       - name: Smoke test (offline engine on sample data)
-        run: python -c "
+        run: |
+          python - <<'PY'
           import pandas as pd
           from engine.signal_engine import analyze_frame
           df = pd.read_csv('data_samples/btcusdt_15m_sample.csv')
           out = analyze_frame(df, symbol='BTCUSDT', timeframe='15m')
           assert out.best_signal['asset'] == 'BTCUSDT'
           print('smoke OK:', out.best_signal['action'], out.best_signal['confidence'])
-          "
+          PY

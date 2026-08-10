@@ -24,7 +24,10 @@ Endpoints
   GET /api/paper    paper-trade state, outcomes, and runner statistics
   POST /api/paper/run  enroll/check approved paper trades once
   GET /api/coach    explain + mentor + personal feedback
-  GET /api/health   health check
+  GET /api/health   full system health (data feeds, DB, risk gate, MCP, LLM)
+  GET /api/agents   desk morning briefing (every watchlist asset + gate + queue)
+  GET /api/mcp      MCP server availability + tools
+  POST /api/ask     natural-language question to the desk
 """
 from __future__ import annotations
 
@@ -39,6 +42,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 from config import SYMBOL, SYMBOLS, TIMEFRAME, BARS, MIN_CONFIDENCE, DEFAULT_RISK_REWARD, DASHBOARD_HOST, DASHBOARD_PORT, VERSION
 from data.symbols import normalize_symbol, resolve_symbol, symbol_choices
+from data.sample_client import maybe_client
 from data.binance_client import BinanceClient
 from engine.signal_engine import analyze_frame
 from output.signal_schema import validate_output
@@ -57,6 +61,10 @@ def _persist(payload: dict) -> tuple[int, str]:
     from data.database import SignalDB
     from engine.lifecycle import reviewable
     sig = payload.get("signal", {})
+    decision = payload.get("decision") or {}
+    # Desk-first (decision A4): desk-vetoed signals never enter the queue.
+    desk_ok = decision.get("action") in ("BUY", "SELL") if decision else True
+    status_override = None if desk_ok else "CREATED"
     with SignalDB() as db:
         existing = db.conn.execute(
             "SELECT id, status FROM scans WHERE signal_id=?", (sig.get("signal_id"),)
@@ -64,16 +72,17 @@ def _persist(payload: dict) -> tuple[int, str]:
         if existing:
             scan_id, status = existing["id"], existing["status"]
         else:
-            scan_id = db.save_scan(payload)
-            status = "PENDING_REVIEW" if reviewable(sig) else "CREATED"
+            scan_id = db.save_scan(payload, status_override=status_override)
+            status = "PENDING_REVIEW" if reviewable(sig) and desk_ok else "CREATED"
     payload["scan_id"] = scan_id
-    payload["lifecycle"] = {
-        "status": status,
-        "note": ("awaiting human approval — click Approve / Reject"
-                 if status == "PENDING_REVIEW" else
-                 "monitor-only signal (no action required)" if status == "CREATED" else
-                 f"current state: {status}"),
-    }
+    if status == "CREATED" and decision and decision.get("blocked_by"):
+        note = "DESK BLOCKED — " + "; ".join(decision["blocked_by"])
+    else:
+        note = ("awaiting human approval — click Approve / Reject"
+                if status == "PENDING_REVIEW" else
+                "monitor-only signal (no action required)" if status == "CREATED" else
+                f"current state: {status}")
+    payload["lifecycle"] = {"status": status, "note": note}
     return scan_id, status
 
 
@@ -89,7 +98,7 @@ def _basic_scan(symbol: str, tf: str, save: bool) -> dict:
 
     def _work():
         try:
-            client = BinanceClient()
+            client = maybe_client()
             df = client.klines(symbol, tf, bars=BARS)
             out = analyze_frame(df, symbol=symbol, timeframe=tf,
                                 min_confidence=MIN_CONFIDENCE,
@@ -139,7 +148,7 @@ def compute_payload(symbol: str, tf: str, save: bool = True, use_cache: bool = T
     def _work():
         try:
             from brain.full_pipeline import analyze_full
-            client = BinanceClient()
+            client = maybe_client()
             payload = analyze_full(symbol, tf, bars=BARS, client=client,
                                    with_context=True, with_memory=True)
             payload["validation"] = validate_output(payload)
@@ -321,31 +330,79 @@ function render(d){
       <b>Note</b><span>${esc(lc.note||'')}</span>
     </div>${decideBtns}`, true);
 
+  const dec=d.decision||{};
+  if(dec.action){
+    const dc=dec.gates||{}, pb=dc.playbook||{}, rg=dc.risk||{}, pv=dc.portfolio||{};
+    const decOk = dec.action==='BUY'||dec.action==='SELL';
+    html += card('PROFESSIONAL DESK DECISION', `
+      <div class="flex" style="margin-bottom:8px">
+        <span class="pill ${decOk?'': 'NOTRADE'}">${decOk?('TRADE '+dec.action):'WAIT — NO TRADE'}</span>
+        <span class="badge">${esc(dec.decision_text||'')}</span>
+        <span class="badge">${esc(dec.regime_label||'')}</span>
+        <span class="badge">setup: ${esc(dec.plan_type||'—')}</span>
+      </div>
+      ${pb.name?`<div class="kv"><b>Playbook</b><span>${esc(pb.name)} — ${esc(pb.note||'')}</span></div>`:''}
+      ${(pb.checks||[]).map(c=>`<div class="note" style="margin-top:2px">${c.ok?'✓':'✗'} ${esc(c.detail)}</div>`).join('')}
+      ${(rg.blocked_by||[]).map(b=>`<div class="err">✗ risk: ${esc(b)}</div>`).join('')}
+      ${(pv.reasons||[]).map(b=>`<div class="err">✗ portfolio: ${esc(b)}</div>`).join('')}
+      ${dec.blocked_by&&dec.blocked_by.length?`<div class="err" style="margin-top:6px">BLOCKED — ${dec.blocked_by.map(esc).join('; ')}</div>`:''}
+      <div class="note" style="margin-top:6px">The desk decision is the only output you act on. The engine signal above is research.</div>`, true);
+  }
+
   const intel=d.intelligence||{};
+  const scard=intel.signal_card||{};
   if(intel.asset){
     const fchecks=intel.trade_filter||{};
-    html += card('AI TRADING DESK — professional filter', `
-      <div class="flex" style="margin-bottom:6px">
-        <span class="pill ${cls(intel.signal)}">${esc(intel.signal)}</span>
-        <b>${esc(intel.asset)} · ${esc(intel.timeframe)}</b>
-        <span class="badge">confidence ${intel.confidence??0}%</span>
-        <span class="badge">RR ${esc(intel.risk_reward||'0')}</span>
-        <span class="badge">risk ${esc(intel.risk||'')}</span>
+    const tpl=scard.tp_ladder||[];
+    const tplHtml=tpl.length ? tpl.map(t=>`<tr><td><b>${esc(t.target)}</b></td><td class="mono">$${fmt(t.price)}</td><td style="color:var(--green)">+${fmt(t.gain_pct)}%</td><td>${t.allocation_pct}% size</td><td class="note">${esc(t.management||'')}</td></tr>`).join('') : '';
+    const kelly=intel.kelly_criterion||{};
+
+    html += card('INSTITUTIONAL AI SIGNAL CARD v2.0 — Enterprise Alpha Intelligence', `
+      <div class="flex" style="margin-bottom:10px;justify-content:space-between;border-bottom:1px solid var(--line);padding-bottom:8px">
+        <div class="flex">
+          <span class="pill ${cls(intel.signal)}">${esc(intel.signal)}</span>
+          <b>${esc(intel.asset)} · ${esc(intel.timeframe)}</b>
+          <span class="badge" style="background:var(--blue);color:#fff;font-weight:700">Grade ${esc(intel.trade_quality_grade||'N/A')}</span>
+        </div>
+        <div class="flex">
+          <span class="badge" style="background:rgba(59,130,246,.15);color:var(--blue)">IPS ${intel.institutional_probability_score??intel.confidence??0}/100</span>
+          <span class="badge" style="background:rgba(34,197,94,.15);color:var(--green)">AI Confidence ${scard.ai_confidence_index||(intel.confidence+'%')} ${scard.confidence_delta||''}</span>
+        </div>
       </div>
-      <div class="kv">
-        <b>Trend</b><span>${esc(intel.trend)} · ${esc(intel.market_structure)}</span>
-        <b>Entry</b><span class="mono">${(intel.entry||[]).map(fmt).join(', ')||'—'}</span>
-        <b>Stop</b><span class="mono">${fmt(intel.stop_loss)}</span>
-        <b>Targets</b><span class="mono">${(intel.take_profit||[]).map(fmt).join(', ')||'—'}</span>
-        <b>News</b><span>${esc(intel.news)}</span>
-        <b>Liquidity</b><span>${esc(intel.liquidity)}</span>
-        <b>SMC</b><span>OB ${esc(intel.order_block)} · FVG ${esc(intel.fair_value_gap)}</span>
-        <b>Decision</b><span>${esc(intel.self_review?.capital_preservation_decision||'')}</span>
+      <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-bottom:10px">
+        <div class="kv">
+          <b>Entry Zone</b><span class="mono" style="color:var(--txt);font-weight:700">${esc(intel.entry_zone||'N/A')}</span>
+          <b>Stop Loss</b><span class="mono" style="color:var(--red)">${esc(scard.stop_loss_display||fmt(intel.stop_loss))}</span>
+          <b>Risk:Reward</b><span><b>${esc(intel.risk_reward||'1:2.0')}</b></span>
+          <b>Hold Time</b><span>${esc(intel.expected_hold_time||'4–8 Hours')}</span>
+          <b>Active Until</b><span class="note">${esc(intel.active_until||'N/A')}</span>
+        </div>
+        <div class="kv">
+          <b>Market Regime</b><span>${esc(intel.regime?.label||intel.trend)}</span>
+          <b>Liquidity Trap</b><span>${intel.regime?.trap_detected?'<span class="err">⚠️ Trap / Fakeout Risk</span>':'<span class="okc">✓ Clean / No Trap</span>'}</span>
+          <b>Order Flow SMC</b><span>OB: ${esc(intel.order_block)} · FVG: ${esc(intel.fair_value_gap)}</span>
+          <b>Kelly Sizing</b><span>${kelly.recommended_risk_pct?kelly.recommended_risk_pct+'% risk ($'+fmt(kelly.recommended_risk_amt)+')':'Fixed 1.0%'} · ${esc(kelly.recommended_leverage||'1x-3x')}</span>
+          <b>Capital Preserv.</b><span>${esc(intel.self_review?.capital_preservation_decision||'Capital protected')}</span>
+        </div>
       </div>
-      <div class="note" style="margin-top:6px">${(intel.reason||[]).slice(0,6).map(r=>'• '+esc(r)).join('<br>')}</div>
-      <details style="margin-top:8px"><summary>scenarios + filter checks</summary>
-        <div class="note" style="margin-top:6px">A: ${esc(intel.scenario_A)}<br>B: ${esc(intel.scenario_B)}<br>C: ${esc(intel.scenario_C)}</div>
-        <table style="margin-top:6px"><tr><th>Filter</th><th>OK</th><th>Value</th></tr>${Object.entries(fchecks).map(([k,v])=>`<tr><td>${esc(k)}</td><td style="color:${v.ok?'var(--green)':'var(--red)'}">${v.ok?'✓':'✗'}</td><td>${esc(v.value??'')}</td></tr>`).join('')}</table>
+      ${tplHtml ? `<div style="margin:10px 0"><b>Smart Take-Profit Ladder</b><table style="margin-top:4px"><tr><th>Target</th><th>Price</th><th>Gain</th><th>Allocation</th><th>Action / Management</th></tr>${tplHtml}</table></div>` : ''}
+      <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-top:10px">
+        <div style="background:#0e1524;padding:10px;border-radius:8px;border:1px solid var(--line)">
+          <b style="color:var(--green)">Why AI Took This Trade:</b>
+          <div class="note" style="margin-top:6px">${(scard.why_ai_took_trade||intel.reason||[]).slice(0,4).map(r=>'• '+esc(r)).join('<br>')}</div>
+        </div>
+        <div style="background:#0e1524;padding:10px;border-radius:8px;border:1px solid var(--line)">
+          <b style="color:var(--red)">Invalidation Conditions:</b>
+          <div class="note" style="margin-top:6px">${(scard.invalidation_conditions||[]).slice(0,3).map(r=>'• '+esc(r)).join('<br>')}</div>
+        </div>
+      </div>
+      <div style="background:#0e1524;padding:10px;border-radius:8px;border:1px solid var(--line);margin-top:10px">
+        <b>Alternative Scenario:</b>
+        <div class="note" style="margin-top:4px">${esc(scard.alternative_scenario||intel.scenario_B||'')}</div>
+      </div>
+      <details style="margin-top:8px"><summary>Desk Filter Checks & Full Scenarios</summary>
+        <div class="note" style="margin-top:6px">Scenario A: ${esc(intel.scenario_A)}<br>Scenario B: ${esc(intel.scenario_B)}<br>Scenario C: ${esc(intel.scenario_C)}</div>
+        <table style="margin-top:6px"><tr><th>Filter Check</th><th>Status</th><th>Value</th></tr>${Object.entries(fchecks).map(([k,v])=>`<tr><td>${esc(k)}</td><td style="color:${v.ok?'var(--green)':'var(--red)'}">${v.ok?'✓ PASS':'✗ FAIL'}</td><td>${esc(v.value??'')}</td></tr>`).join('')}</table>
       </details>`, true);
   }
 
@@ -464,6 +521,13 @@ function render(d){
     </div>
     <div id="diag" class="note" style="margin-top:6px"></div>`);
   html += card('HUMAN APPROVAL QUEUE', '<div id="queue">loading…</div>');
+  html += card('RISK & DISCIPLINE GATE', '<div id="riskgate">loading…</div>', true);
+  html += card('SYSTEM HEALTH', '<div id="health">loading…</div>');
+  html += card('AGENTS — MORNING BRIEFING', '<div id="agents">loading…</div>', true);
+  html += card('MCP SERVER', '<div id="mcp">loading…</div>');
+  html += card('ASK THE DESK', `<div class="flex"><input id="askq" placeholder="ask the desk… e.g. is the risk gate open? / scan BTC / what's pending?" style="flex:1" onkeydown="if(event.key==='Enter')askDesk()">
+    <button class="rowbtn" onclick="askDesk()">Ask</button></div>
+    <div id="askout" class="note" style="white-space:pre-wrap;margin-top:8px"></div>`, true);
   html += card('PAPER TRADING — LIVE OUTCOME RUNNER', '<div id="paper">loading…</div>', true);
   html += card('RECENT SIGNALS', '<div id="hist">loading…</div>');
   html += card('LEARNING — backtest & calibration', '<div id="learn">loading…</div>', true);
@@ -474,6 +538,7 @@ function render(d){
 
   document.getElementById('app').innerHTML = html;
   loadPending(); loadPaper(); loadHistory(); loadLearning(); loadSources();
+  loadRiskGate(); loadHealth(); loadAgents(); loadMcp();
   const symE=document.getElementById('sym'); const tfE=document.getElementById('tf');
   loadChart((symE?symE.value:'BTCUSDT').toUpperCase(), tfE?tfE.value:'15m');
 }
@@ -616,6 +681,43 @@ async function loadPaper(){
   }catch(e){ const el=document.getElementById('paper'); if(el) el.innerHTML='<span class="err">'+esc(e)+'</span>'; }
 }
 
+async function loadRiskGate(){
+  const el=document.getElementById('riskgate'); if(!el) return;
+  try{
+    const d=await (await fetch('/api/risk')).json();
+    if(d.error){ el.innerHTML='<span class="err">'+esc(d.error)+'</span>'; return; }
+    const g=d.gate||{}, det=(g.details||{}), dw=det.drawdown||{}, dws=det.daily_weekly||{},
+          eff=det.effective_risk||{}, st=d.trader_state||{}, m=d.metrics||{}, o=(m.overall||{}),
+          j=d.journal||{};
+    const closed=g.allowed===false;
+    const flagBtn=(k,l)=>`<button class="rowbtn ${st[k]?'no':''}" onclick="setTraderState('${k}',${st[k]?0:1})">${l} ${st[k]?'ON':'off'}</button>`;
+    let html=`<div class="flex" style="margin-bottom:8px">
+        <span class="pill ${closed?'NOTRADE':'BUY'}">${closed?'GATE CLOSED':'GATE OPEN'}</span>
+        <span class="badge">progression: ${esc(det.progression?.level||'student')}</span>
+        <span class="badge">risk ${eff.risk_pct}% / day ${eff.daily}% / week ${eff.weekly}%</span></div>`;
+    html+=`<div class="kv">
+        <b>Today</b><span class="mono">${dws.today?.pct!=null?dws.today.pct.toFixed(2)+'% ('+dws.today.n+' trades)':'—'}</span>
+        <b>This week</b><span class="mono">${dws.week?.pct!=null?dws.week.pct.toFixed(2)+'%':'—'}</span>
+        <b>Drawdown</b><span class="mono">${dw.max_drawdown_pct!=null?dw.max_drawdown_pct.toFixed(2)+'% → '+esc(dw.level||''):'—'}</span>
+        <b>Record</b><span>${o.n?o.wins+'W/'+o.losses+'L · PF '+(o.profit_factor??'—')+' · exp '+(o.expectancy_r!=null?o.expectancy_r.toFixed(2)+'R':'—'):'no decided paper trades yet'}</span>
+        <b>Discipline</b><span>${j.n?j.violation_rate*100+'% violations ('+j.violations+'/'+j.n+')':'no journal entries yet'}</span></div>`;
+    html+=`<div class="flex" style="margin-top:8px">${flagBtn('angry','😡 Angry')}${flagBtn('tired','😴 Tired')}${flagBtn('revenge','🔁 Revenge')}${flagBtn('chasing','🏃 Chasing')}
+      <button class="rowbtn" onclick="setTraderState('all',0)">✕ Clear all</button></div>`;
+    if(st.note) html+=`<div class="note" style="margin-top:4px">note: ${esc(st.note)}</div>`;
+    if(closed) html+=`<div class="err" style="margin-top:6px">No new trades — ${g.blocked_by.map(esc).join('; ')}</div>`;
+    html+=`<div class="note" style="margin-top:6px">Enforced at approval + paper runner. CLI: <code>python main.py risk</code> · <code>python main.py tradestate</code> · <code>python main.py journal</code></div>`;
+    el.innerHTML=html;
+  }catch(e){ el.innerHTML='<span class="err">'+esc(e)+'</span>'; }
+}
+
+async function setTraderState(key, val){
+  try{
+    await fetch('/api/trader-state',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(key==='all'?{angry:false,tired:false,revenge:false,chasing:false}:{[key]:!!val})});
+  }catch(e){}
+  loadRiskGate();
+}
+
 async function runPaper(){
   const m=document.getElementById('papermsg'); if(m) m.textContent='checking live candles…';
   try{
@@ -623,6 +725,75 @@ async function runPaper(){
     if(m) m.textContent=d.ok?`✓ checked ${d.run.checked||0}; entries ${d.run.opened||0}; closed ${d.run.closed||0}`:'error: '+(d.error||'');
   }catch(e){ if(m) m.textContent='error: '+e; }
   loadPaper(); loadHistory(); loadPending(); loadLearning();
+}
+
+async function loadHealth(){
+  const el=document.getElementById('health'); if(!el) return;
+  try{
+    const d=await (await fetch('/api/health')).json();
+    if(d.error){ el.innerHTML='<span class="err">'+esc(d.error)+'</span>'; return; }
+    const dm=d.data||{}, db_=d.database||{}, gate=d.risk_gate||{}, prog=gate.progression||{},
+          probes=Object.entries(dm.probe||{});
+    el.innerHTML=`<div class="kv">
+      <b>Mode</b><span>${esc(dm.mode||'?')}${dm.live?'':' <span class="note">(demo)</span>'}</span>
+      <b>Database</b><span>${db_.ok?'ok':'<span class="err">FAIL</span>'} · ${db_.scans||0} scans · ${db_.backtest_samples||0} bt · ${db_.paper_samples||0} paper</span>
+      <b>Risk gate</b><span class="${gate.allowed?'okc':'err'}">${gate.allowed?'OPEN':'CLOSED'}</span>
+      <b>Progression</b><span>${esc(prog.level||'?')}</span>
+      <b>Learning</b><span>${(d.learning||{}).calibration_entries||0} entries · ${((d.learning||{}).proven_setups||[]).length} proven</span>
+      <b>MCP</b><span>${d.mcp&&d.mcp.available?'ready':'not installed'}</span>
+      <b>LLM</b><span>${d.llm&&d.llm.enabled?'enabled':'off'}</span></div>
+      ${probes.length?`<div class="note" style="margin-top:6px">data feeds: ${probes.map(([s,p])=>`${esc(s)} ${p.ok?'✓':'✗'}`).join(' · ')}</div>`:''}
+      <div class="note" style="margin-top:4px">Same report as <code>python main.py agent health</code>.</div>`;
+  }catch(e){ el.innerHTML='<span class="err">'+esc(e)+'</span>'; }
+}
+
+async function loadAgents(){
+  const el=document.getElementById('agents'); if(!el) return;
+  el.innerHTML='<span class="muted">building briefing…</span>';
+  try{
+    const d=await (await fetch('/api/agents')).json();
+    if(d.error){ el.innerHTML='<span class="err">'+esc(d.error)+'</span>'; return; }
+    const rows=(d.assets||[]).map(a=>{
+      const side=a.desk_action||a.action||'';
+      const mark=(side==='BUY'||side==='SELL')?(a.blocked_by&&a.blocked_by.length?'⚠':'✓'):'·';
+      const conf=a.confidence_pct!=null?a.confidence_pct+'%':(a.confidence||'—');
+      const vetoes=(a.blocked_by||[]).map(esc).join('; ');
+      return `<div class="row"><span>${mark} <b>${esc(a.symbol)}</b> <span class="${cls(side)}">${side}</span> conf=${conf} ${a.entry?'@ '+fmt(a.entry):''}</span>
+        <span class="note">${esc((a.reason||'').slice(0,60))}${vetoes?'<br><span class="err">✗ '+vetoes+'</span>':''}</span></div>`;
+    }).join('');
+    const gate=d.risk_gate||{}, prog=gate.progression||{};
+    el.innerHTML=`${rows||'<span class="muted">no assets</span>'}
+      <div class="note" style="margin-top:6px">Risk gate ${gate.allowed?'OPEN':'CLOSED'} · progression ${esc(prog.level||'?')} · ${d.pending_reviews||0} pending · ${(d.open_exposure||[]).length} open paper trade(s)</div>
+      <div class="note" style="white-space:pre-wrap;margin-top:6px">${esc(d.narrative||'')}</div>
+      <div class="note" style="margin-top:4px">CLI: <code>python main.py agent morning</code>.</div>`;
+  }catch(e){ el.innerHTML='<span class="err">'+esc(e)+'</span>'; }
+}
+
+async function loadMcp(){
+  const el=document.getElementById('mcp'); if(!el) return;
+  try{
+    const d=await (await fetch('/api/mcp')).json();
+    if(d.error){ el.innerHTML='<span class="err">'+esc(d.error)+'</span>'; return; }
+    el.innerHTML=`<div class="kv">
+      <b>Server</b><span class="${d.available?'okc':'err'}">${d.available?'ready':'not installed'}</span>
+      <b>Tools</b><span>${d.count||0}</span>
+      <b>Transport</b><span>stdio (JSON-RPC 2.0)</span></div>
+      <div class="note" style="margin-top:6px">${esc(d.note||'')}</div>
+      <div class="note" style="margin-top:6px">${(d.tools||[]).map(t=>'<code>'+esc(t)+'</code>').join(' · ')}</div>`;
+  }catch(e){ el.innerHTML='<span class="err">'+esc(e)+'</span>'; }
+}
+
+async function askDesk(){
+  const q=document.getElementById('askq'); const out=document.getElementById('askout');
+  const question=(q?q.value:'').trim(); if(!question) return;
+  if(out) out.innerHTML='<span class="muted">thinking…</span>';
+  try{
+    const d=await (await fetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({question})})).json();
+    const lines=(d.answer||[]);
+    if(out) out.innerHTML=(lines.length?lines.map(l=>esc(l)).join('<br>'):esc(d.error||'no answer'))+
+      (d.error?'<br><span class="err">'+esc(d.error)+'</span>':'');
+  }catch(e){ if(out) out.innerHTML='<span class="err">'+esc(e)+'</span>'; }
 }
 
 async function loadHistory(){
@@ -663,8 +834,22 @@ async function loadLearning(){
       html+=`<span class="muted">No backtest data yet. Click <b>▶ Quick backtest + learn</b> to grade the engine on recent data (~30s) and auto-apply the calibration.</span>`;
     }
     if(entries.length){
-      html+=`<div style="margin-top:10px"><b>Calibration (applied to future signals)</b><table><tr><th>Plan</th><th>Mult</th><th>Exp R</th><th>Samples</th></tr>`+
-        entries.map(([k,v])=>`<tr><td>${esc(k)}</td><td>${v.filtered?'<span class="err">FILTERED</span>':'×'+v.multiplier}</td><td>${v.expectancy!=null?v.expectancy.toFixed(2):'—'}</td><td>${v.samples}</td></tr>`).join('')+`</table></div>`;
+      html+=`<div style="margin-top:10px"><b>Calibration (applied to future signals)</b><table><tr><th>Plan</th><th>Mult</th><th>Exp R</th><th>Bt/Pp</th><th>Proven</th><th>TP R</th></tr>`+
+        entries.map(([k,v])=>`<tr><td>${esc(k)}</td><td>${v.filtered?'<span class="err">FILTERED</span>':'×'+v.multiplier}</td><td>${v.expectancy!=null?v.expectancy.toFixed(2):'—'}</td><td>${v.backtest_samples||0}/${v.paper_samples||0}</td><td>${v.proven?'<span class="okc">✓ proven</span>':'<span class="note">unproven</span>'}</td><td>${v.tp_rr!=null?v.tp_rr:'—'}</td></tr>`).join('')+`</table></div>`;
+    }
+    const bm=d.metrics||{}, bo=bm.overall||{};
+    if(bo.n){
+      html+=`<div style="margin-top:10px"><b>Business scorecard (decided paper trades)</b><div class="kv">
+        <b>Win rate</b><span>${(bo.win_rate*100).toFixed(1)}% (${bo.wins}W/${bo.losses}L)</span>
+        <b>Expectancy</b><span>${bo.expectancy_r!=null?bo.expectancy_r.toFixed(3)+'R':'—'}</span>
+        <b>Profit factor</b><span>${bo.profit_factor??'—'}</span>
+        <b>Max drawdown</b><span>${bo.max_drawdown_pct!=null?bo.max_drawdown_pct.toFixed(2)+'%':'—'}</span>
+        <b>Streaks</b><span>${bo.max_win_streak||0}W / ${bo.max_loss_streak||0}L</span>
+        <b>Avg win/loss</b><span>${bo.avg_win_r!=null?bo.avg_win_r.toFixed(2)+'R':'—'} / ${bo.avg_loss_r!=null?bo.avg_loss_r.toFixed(2)+'R':'—'}</span></div></div>`;
+    }
+    const jj=d.journal||{};
+    if(jj.n){
+      html+=`<div class="note" style="margin-top:6px">Discipline: ${jj.violations}/${jj.n} trades (${(jj.violation_rate*100).toFixed(1)}%) violated the system — the goal is 0%.</div>`;
     }
     el.innerHTML=html;
   }catch(e){ const el=document.getElementById('learn'); if(el) el.innerHTML='<span class="err">'+esc(e)+'</span>'; }
@@ -746,8 +931,15 @@ async function openModal(id){
       ${paper.id?`<h3 style="margin:14px 0 6px">Paper-trade monitor</h3><div class="kv">
         <b>Status</b><span>${esc(paper.status||'—')}</span><b>Setup</b><span>${esc(paper.plan_type||'Signal')}</span>
         <b>Outcome</b><span>${esc(paper.outcome||'—')}</span><b>R achieved</b><span>${paper.rr_achieved!=null?paper.rr_achieved+'R':'—'}</span>
+        <b>MAE / MFE</b><span class="mono">${paper.mae!=null?fmt(paper.mae):'—'} / ${paper.mfe!=null?fmt(paper.mfe):'—'}</span>
+        <b>Regime</b><span>${esc(paper.regime||'—')}</span>
         <b>Last price</b><span class="mono">${fmt(paper.last_price)}</span><b>Note</b><span>${esc(paper.close_reason||'')}</span>
       </div>`:''}
+      ${d.journal?`<h3 style="margin:14px 0 6px">Journal (post-trade)</h3><div class="kv">
+        <b>Followed rules</b><span>${d.journal.followed_rules==null?'—':d.journal.followed_rules?'<span class="okc">YES</span>':'<span class="err">NO</span>'}</span>
+        <b>Emotion</b><span>${esc(d.journal.emotion||'—')}</span><b>Mistake</b><span>${esc(d.journal.mistake||'—')}</span>
+        <b>Would change</b><span>${esc(d.journal.would_change||'—')}</span><b>Notes</b><span>${esc(d.journal.notes||'—')}</span>
+      </div><div class="note" style="margin-top:4px">Record/update: <code>python main.py journal ${s.id} --followed-rules 1 --emotion calm ...</code></div>`:''}
       <h3 style="margin:14px 0 6px">Lifecycle trail</h3>
       ${decs.length?decs.map(x=>`<div class="muted">${esc(x.from_state||'')} → <b>${esc(x.to_state||'')}</b> by ${esc(x.reviewer||'')} <span class="note">${esc(x.note||'')}</span></div>`).join(''):'<span class="muted">no decisions yet</span>'}
       <h3 style="margin:14px 0 6px">Plans</h3>
@@ -848,7 +1040,7 @@ def make_app() -> Flask:
             from data.database import SignalDB
             from data.paper_trading import PaperTradingRunner
             with SignalDB() as db:
-                run = PaperTradingRunner(db=db, client=BinanceClient()).run_once(symbol=symbol).as_dict()
+                run = PaperTradingRunner(db=db, client=maybe_client()).run_once(symbol=symbol).as_dict()
             return jsonify({"ok": True, "run": run})
         except Exception as exc:
             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
@@ -859,11 +1051,28 @@ def make_app() -> Flask:
         scan_id = body.get("scan_id")
         decision = (body.get("decision") or "").upper()
         note = body.get("note", "")
+        force = bool(body.get("force"))
         if decision not in ("APPROVED", "REJECTED", "EXECUTED", "CLOSED", "SKIPPED"):
             return jsonify({"error": f"bad decision {decision}"}), 400
         from data.database import SignalDB
         from engine.lifecycle import LifecycleError
+        from brain.risk_gate import evaluate as gate_evaluate
+        from data.paper_trading import _primary_plan
         with SignalDB() as db:
+            # Enforced risk & discipline gate (decisions B6/B7/B9/B10).
+            if decision == "APPROVED" and not force:
+                scan = db.get_scan(int(scan_id)) if str(scan_id).isdigit() else None
+                if scan is None:
+                    return jsonify({"error": f"scan #{scan_id} not found"}), 404
+                plan_type = _primary_plan(scan).get("type")
+                gate = gate_evaluate(db, symbol=scan.get("symbol"),
+                                     plan_type=plan_type, action=scan.get("action"))
+                if not gate["allowed"]:
+                    return jsonify({
+                        "error": "Risk gate CLOSED — " + "; ".join(gate["blocked_by"]),
+                        "blocked_by": gate["blocked_by"],
+                        "force_available": True,
+                    }), 409
             try:
                 new = db.update_status(int(scan_id), decision, note=note,
                                        reviewer="dashboard")
@@ -872,6 +1081,41 @@ def make_app() -> Flask:
             if new is None:
                 return jsonify({"error": f"scan #{scan_id} not found"}), 404
         return jsonify({"ok": True, "scan_id": scan_id, "status": new})
+
+    @app.get("/api/risk")
+    def api_risk():
+        """Risk & discipline gate status (decisions B4/B5/B6/B7/B9)."""
+        from data.database import SignalDB
+        from brain.risk_gate import evaluate as gate_evaluate, status_text
+        from brain.metrics import business_metrics
+        from brain.journal import violation_rate
+        try:
+            with SignalDB() as db:
+                gate = gate_evaluate(db)
+                metrics = business_metrics(db)
+                journal = violation_rate(db)
+                state = db.get_trader_state()
+            return jsonify({
+                "gate": gate,
+                "trader_state": state,
+                "metrics": metrics,
+                "journal": journal,
+                "status_text": status_text.__doc__ or "",
+            })
+        except Exception as exc:
+            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+
+    @app.post("/api/trader-state")
+    def api_trader_state():
+        """Set/clear behavioral no-trade flags (decision B7)."""
+        body = request.get_json(silent=True) or {}
+        from data.database import SignalDB
+        with SignalDB() as db:
+            state = db.set_trader_state(
+                angry=body.get("angry"), tired=body.get("tired"),
+                revenge=body.get("revenge"), chasing=body.get("chasing"),
+                note=body.get("note", ""))
+        return jsonify({"ok": True, "state": state})
 
     @app.get("/api/history")
     def api_history():
@@ -890,18 +1134,23 @@ def make_app() -> Flask:
             plans = json.loads(scan.get("plans_json") or "[]")
             decisions = db.decision_history(scan_id)
             paper_trade = db.paper_trade_for_scan(scan_id)
+            journal = db.get_journal(scan_id)
         return jsonify({"scan": scan, "plans": plans, "decisions": decisions,
-                        "paper_trade": paper_trade})
+                        "paper_trade": paper_trade, "journal": journal})
 
     @app.get("/api/learning")
     def api_learning():
         from data.database import SignalDB
         try:
             with SignalDB() as db:
+                from brain.metrics import business_metrics
+                from brain.journal import violation_rate
                 return jsonify({
                     "backtest": db.backtest_stats(),
                     "calibration": db.load_calibration(),
                     "plan_stats": db.plan_stats(),
+                    "metrics": business_metrics(db),
+                    "journal": violation_rate(db),
                 })
         except Exception as exc:  # never 500 — the card degrades gracefully
             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}",
@@ -930,7 +1179,7 @@ def make_app() -> Flask:
         tf = request.args.get("tf", TIMEFRAME)
         limit = min(int(request.args.get("limit", 90)), 300)
         try:
-            df = BinanceClient().klines(symbol, tf, limit)
+            df = maybe_client().klines(symbol, tf, limit)
             return jsonify({"candles": df.to_dict("records"),
                             "symbol": symbol, "tf": tf})
         except ConnectionError as exc:
@@ -968,7 +1217,7 @@ def make_app() -> Flask:
             from brain.calibrator import learn
             from data.backtester import run_backtest
             from data.database import SignalDB
-            df = BinanceClient().klines(symbol, tf, bars)
+            df = maybe_client().klines(symbol, tf, bars)
             res = run_backtest(df, symbol=symbol, timeframe=tf,
                                horizons=horizons, step=step,
                                min_confidence=MIN_CONFIDENCE)
@@ -1057,7 +1306,53 @@ def make_app() -> Flask:
 
     @app.get("/api/health")
     def health():
-        return jsonify({"ok": True})
+        """Full system health — same report as `python main.py agent health`."""
+        try:
+            from brain.agent import health_report
+            return jsonify(health_report())
+        except Exception as exc:  # never 500 — degrade gracefully
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    @app.get("/api/agents")
+    def api_agents():
+        """Desk morning briefing: watchlist + gate + queue + narrative."""
+        try:
+            from brain.agent import morning_briefing
+            return jsonify(morning_briefing(timeframe=request.args.get("tf", TIMEFRAME)))
+        except Exception as exc:  # never 500 — degrade gracefully
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    @app.get("/api/mcp")
+    def api_mcp():
+        """MCP server status + tool inventory for the dashboard card."""
+        try:
+            from ai.mcp_server import TOOLS
+            try:
+                import mcp  # noqa: F401
+                available = True
+                note = "run `python main.py mcp` and point Claude Desktop / Cursor at it"
+            except Exception:
+                available = False
+                note = "mcp package not installed — pip install mcp"
+            return jsonify({"available": available, "note": note,
+                            "count": len(TOOLS),
+                            "tools": [t["name"] for t in TOOLS]})
+        except Exception as exc:
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    @app.post("/api/ask")
+    def api_ask():
+        """Natural-language question to the desk (intent-based, offline-capable)."""
+        body = request.get_json(silent=True) or {}
+        question = str(body.get("question", "")).strip()
+        if not question:
+            return jsonify({"ok": False, "error": "empty question"}), 400
+        try:
+            from brain.agent import ask
+            return jsonify(ask(question, symbol=_sym(body.get("symbol")),
+                               timeframe=body.get("tf", TIMEFRAME)))
+        except Exception as exc:
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
 
     return app
 

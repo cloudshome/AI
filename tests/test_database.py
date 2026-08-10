@@ -133,3 +133,35 @@ def test_backtest_rows_and_stats(tmp_path):
     assert buckets["HIGH"]["win_rate"] == 1.0
     assert buckets["MEDIUM"]["win_rate"] == 0.0
     db.close()
+
+
+def test_decided_paper_rows_exclude_sim(tmp_path):
+    """exclude_sim=True drops simulator walk-forward samples (sim_key NOT
+    NULL): they are calibration evidence, not the live paper book."""
+    import time
+    db = SignalDB(tmp_path / "ex.db")
+    ts = int(time.time() * 1000)
+
+    def insert(rr: float, sim_key, i: int) -> None:
+        outcome = "TP_HIT" if rr > 0 else "STOP_LOSS"
+        db.conn.execute(
+            """INSERT INTO paper_trades(scan_id, signal_id, plan_type, symbol, timeframe,
+                                        action, entry, stop_loss, take_profit, risk_reward,
+                                        confidence_pct, status, created_ts, opened_ts,
+                                        closed_ts, entry_price, exit_price, outcome,
+                                        rr_achieved, close_reason, sim_key)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (9000 + i, f"S{i}", "Buy Pullback", "BTCUSDT", "15m", "BUY",
+             100.0, 99.0, 102.0, 2.0, 70, "CLOSED", ts, ts, ts,
+             100.0, 102.0 if rr > 0 else 99.0, outcome, rr, "test", sim_key))
+    db.conn.commit()
+
+    insert(2.0, sim_key=None, i=0)                                  # real trade
+    insert(-1.0, sim_key="pp:btc:15m:1:buy_pullback:BUY", i=1)      # sim sample
+
+    assert len(db.decided_paper_rows()) == 2
+    real = db.decided_paper_rows(exclude_sim=True)
+    assert len(real) == 1
+    assert real[0]["rr_achieved"] == 2.0
+    assert real[0]["sim_key"] is None
+    db.close()

@@ -34,6 +34,7 @@ from .structure import analyze_structure
 from .features import build_snapshot
 from .scorer import score_bullish, score_bearish, score_neutral, ScoreBreakdown
 from .rules import build_plans, Plan
+from .regime import classify_market_regime
 
 
 @dataclass
@@ -95,10 +96,15 @@ def build_best_signal(features: dict, bull: ScoreBreakdown, bear: ScoreBreakdown
                       plans: list[Plan], symbol: str, timeframe: str,
                       min_confidence: int) -> dict:
     """Emit the single best actionable signal (or NO TRADE) in the requested
-    schema, with entry/SL/TP taken from the top plan when available."""
+    schema, with entry/SL/TP taken from the top PRIMARY plan when available.
+
+    Decision A1: only plans inside the chosen primary setup family may become
+    the best signal; everything else is a research watch-item.
+    """
     now_ms = int(time.time() * 1000)
     price = features.get("price") or 0.0
-    top = plans[0] if plans else None
+    primary = [p for p in plans if p.primary]
+    top = (primary or plans)[0] if (primary or plans) else None
 
     if top and top.confidence_pct >= min_confidence:
         action = top.action
@@ -136,12 +142,19 @@ def build_best_signal(features: dict, bull: ScoreBreakdown, bear: ScoreBreakdown
 
 def analyze_frame(df: pd.DataFrame, symbol: str = "BTCUSDT", timeframe: str = "15m",
                   min_confidence: int = 55, default_rr: float = 2.0,
-                  calibration: dict | None = None) -> BrainOutput:
+                  calibration: dict | None = None,
+                  primary_types: set | None = None,
+                  tp_rr_by_type: dict | None = None) -> BrainOutput:
     """Run the full brain on one OHLCV frame.
 
     `calibration` is the optional self-improvement profile (plan_type ->
     multiplier / filtered) produced by brain.calibrator; None keeps behaviour
-    identical to an uncalibrated engine.
+    identical to an uncalibrated engine.  Profiles may be regime-keyed
+    (``plan_type::regime``).
+
+    `primary_types` (decision A1) narrows which plans may become the best
+    signal.  `tp_rr_by_type` (decision A2) supplies per-setup, data-driven
+    take-profit distances in R.
     """
     symbol = normalize_symbol(symbol)
     df = df.copy()
@@ -153,6 +166,15 @@ def analyze_frame(df: pd.DataFrame, symbol: str = "BTCUSDT", timeframe: str = "1
     div = find_rsi_divergence(ind)
     features = build_snapshot(ind, ms, div, ms.equal_levels)
 
+    # Regime tagging (decision B3): every frame knows its market regime, so
+    # backtests, paper trades and calibration can all be regime-dimensioned.
+    regime = classify_market_regime(df, features)
+    features["regime"] = regime
+    features["regime_name"] = regime.get("regime", "RANGING")
+    features["regime_label"] = regime.get("label", "Ranging / Neutral")
+    features["fake_breakout"] = bool(regime.get("fake_breakout"))
+    features["trap_detected"] = bool(regime.get("trap_detected"))
+
     bull = score_bullish(features)
     bear = score_bearish(features)
     if bull.score == 0 and bear.score == 0:
@@ -161,7 +183,9 @@ def analyze_frame(df: pd.DataFrame, symbol: str = "BTCUSDT", timeframe: str = "1
 
     plans = build_plans(features, bull, bear,
                         min_confidence=min_confidence, default_rr=default_rr,
-                        calibration=calibration)
+                        calibration=calibration, primary_types=primary_types,
+                        tp_rr_by_type=tp_rr_by_type,
+                        regime=features.get("regime_name", ""))
     best = build_best_signal(features, bull, bear, plans, symbol, timeframe,
                              min_confidence)
 

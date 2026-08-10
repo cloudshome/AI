@@ -86,7 +86,7 @@ def test_immediate_approved_trade_auto_closes_at_target(tmp_path):
     # The active top plan fills on approval. This later candle reaches only
     # TP1, so the result must be a paper win and lifecycle CLOSED.
     client = CandleClient([_candle(NOW + 1, low=61_000.0, high=62_300.0, close=62_200.0)])
-    result = PaperTradingRunner(db, client, clock_ms=lambda: NOW).run_once()
+    result = PaperTradingRunner(db, client, clock_ms=lambda: NOW, enforce_gate=False).run_once()
 
     trade = db.paper_trade_for_scan(sid)
     assert result.enrolled == 1
@@ -108,7 +108,7 @@ def test_waiting_trade_enters_then_closes_on_same_candle(tmp_path):
     # Low reaches the planned pullback entry; high then reaches TP. OHLCV
     # cannot give exact intrabar ordering, but only TP is touched after entry.
     client = CandleClient([_candle(NOW + 1, low=99.5, high=111.0, close=109.0)])
-    result = PaperTradingRunner(db, client, clock_ms=lambda: NOW).run_once()
+    result = PaperTradingRunner(db, client, clock_ms=lambda: NOW, enforce_gate=False).run_once()
 
     trade = db.paper_trade_for_scan(sid)
     assert result.enrolled == 1
@@ -127,7 +127,7 @@ def test_waiting_trade_stays_approved_until_entry_is_reached(tmp_path):
     # Candle never reaches 100.0, so the scan must remain human-approved, not
     # falsely marked executed.
     client = CandleClient([_candle(NOW + 1, low=101.0, high=106.0, close=104.0)])
-    result = PaperTradingRunner(db, client, clock_ms=lambda: NOW).run_once()
+    result = PaperTradingRunner(db, client, clock_ms=lambda: NOW, enforce_gate=False).run_once()
 
     trade = db.paper_trade_for_scan(sid)
     assert result.enrolled == 1
@@ -153,7 +153,7 @@ def test_already_executed_conditional_scan_is_treated_as_open(tmp_path):
     assert db.update_status(sid, "EXECUTED", note="manual fill") == "EXECUTED"
     # The monitor must honour the existing fill rather than re-waiting for it.
     client = CandleClient([_candle(NOW + 1, low=101.0, high=106.0, close=104.0)])
-    result = PaperTradingRunner(db, client, clock_ms=lambda: NOW).run_once()
+    result = PaperTradingRunner(db, client, clock_ms=lambda: NOW, enforce_gate=False).run_once()
 
     trade = db.paper_trade_for_scan(sid)
     assert result.enrolled == 1
@@ -166,7 +166,7 @@ def test_paper_outcomes_feed_the_calibrator_but_not_backtest_table(tmp_path):
     db = SignalDB(tmp_path / "paper.db")
     sid = _approve(db, _waiting_payload())
     client = CandleClient([_candle(NOW + 1, low=99.5, high=111.0, close=109.0)])
-    PaperTradingRunner(db, client, clock_ms=lambda: NOW).run_once()
+    PaperTradingRunner(db, client, clock_ms=lambda: NOW, enforce_gate=False).run_once()
 
     learned = compute_expectancy_by_type(db)
     entry = learned["Buy Pullback"]
@@ -180,4 +180,18 @@ def test_paper_outcomes_feed_the_calibrator_but_not_backtest_table(tmp_path):
     stats = db.paper_trade_stats()
     assert stats["overall"]["wins"] == 1
     assert stats["overall"]["win_rate"] == 1.0
+    db.close()
+
+
+def test_runner_gate_blocks_unproven_enrollment(tmp_path):
+    """Decisions B6/B10: at student level the runner refuses to enroll an
+    unproven setup until the gate opens."""
+    from tests.test_database import _payload
+    db = SignalDB(tmp_path / "gate.db")
+    sid = _approve(db, _payload())
+    client = CandleClient([_candle(NOW + 1, low=99.5, high=111.0, close=109.0)])
+    result = PaperTradingRunner(db, client, clock_ms=lambda: NOW).run_once()
+    assert result.enrolled == 0
+    assert any(e["event"] == "GATE_BLOCKED" for e in result.events)
+    assert db.paper_trade_for_scan(sid) is None
     db.close()

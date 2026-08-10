@@ -162,6 +162,15 @@ def _primary_plan(scan: dict) -> dict:
     }
 
 
+def _scan_regime(scan: dict) -> str:
+    """Recover the market-regime tag from a scan row (decision B3)."""
+    try:
+        features = json.loads(scan.get("features_json") or "{}")
+        return features.get("regime_name", "")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+
+
 def paper_fields_from_scan(scan: dict, created_ts: Optional[int] = None) -> dict:
     """Turn one approved scan row into validated paper-trade fields."""
     plan = _primary_plan(scan)
@@ -198,6 +207,7 @@ def paper_fields_from_scan(scan: dict, created_ts: Optional[int] = None) -> dict
         "created_ts": int(created_ts or scan.get("lifecycle_ts") or time.time() * 1000),
         "opened_ts": None if is_waiting else int(created_ts or scan.get("lifecycle_ts") or time.time() * 1000),
         "entry_price": None if is_waiting else entry,
+        "regime": _scan_regime(scan),
     }
 
 
@@ -229,11 +239,13 @@ class PaperTradingRunner:
 
     def __init__(self, db: SignalDB, client: Any,
                  clock_ms: Optional[Callable[[], int]] = None,
-                 candle_limit: int = PAPER_MAX_CANDLES_PER_CHECK):
+                 candle_limit: int = PAPER_MAX_CANDLES_PER_CHECK,
+                 enforce_gate: bool = True):
         self.db = db
         self.client = client
         self.clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self.candle_limit = max(10, min(int(candle_limit), 1000))
+        self.enforce_gate = enforce_gate
 
     def _event(self, result: PaperRun, trade: dict, event: str, **extra: Any) -> None:
         result.events.append({
@@ -243,11 +255,30 @@ class PaperTradingRunner:
         })
 
     def enroll_approved(self, symbol: Optional[str] = None, result: Optional[PaperRun] = None) -> PaperRun:
-        """Create durable paper records for un-enrolled APPROVED/EXECUTED scans."""
+        """Create durable paper records for un-enrolled APPROVED/EXECUTED scans.
+
+        Decision B6/B7/B9/B10: the risk & discipline gate is enforced here
+        too — while it is closed (daily limit, drawdown ladder, trader-state
+        flags, unproven setup at a strict progression level) no new simulated
+        position is enrolled.
+        """
         symbol = normalize_symbol(symbol) if symbol else None
         result = result or PaperRun()
+        from brain.risk_gate import evaluate as gate_evaluate, gate_message
         for scan in self.db.paper_candidates(symbol):
             try:
+                if self.enforce_gate:
+                    _plan_type = _primary_plan(scan).get("type")
+                    gate = gate_evaluate(self.db, symbol=scan.get("symbol"),
+                                         plan_type=_plan_type or None,
+                                         action=scan.get("action"))
+                    if not gate["allowed"]:
+                        result.events.append({
+                            "scan_id": scan.get("id"), "symbol": scan.get("symbol"),
+                            "event": "GATE_BLOCKED",
+                            "reason": gate_message(gate),
+                        })
+                        continue
                 fields = paper_fields_from_scan(scan, created_ts=scan.get("lifecycle_ts") or self.clock_ms())
                 trade, created = self.db.create_paper_trade(fields)
                 if not created:
@@ -336,6 +367,26 @@ class PaperTradingRunner:
         # still considered, never an arbitrary older history.
         return out[out["ts"] >= start - tf_ms].sort_values("ts").reset_index(drop=True)
 
+    @staticmethod
+    def _excursion(trade: dict, candle: dict) -> tuple[Optional[float], Optional[float]]:
+        """(mae, mfe) in price units for one candle vs the paper entry.
+
+        MAE/MFE are journal fields (decision B5): how far against / for the
+        position did price travel while the trade was open?
+        """
+        entry_price = trade.get("entry_price")
+        if entry_price is None:
+            return None, None
+        entry_price = float(entry_price)
+        high, low = float(candle["high"]), float(candle["low"])
+        if (trade.get("action") or "").upper() == "BUY":
+            mae = max(0.0, entry_price - low)
+            mfe = max(0.0, high - entry_price)
+        else:
+            mae = max(0.0, high - entry_price)
+            mfe = max(0.0, entry_price - low)
+        return round(mae, 6), round(mfe, 6)
+
     def _process_trade(self, trade: dict, result: PaperRun) -> None:
         if self._cancel_if_manually_ended(trade, result):
             return
@@ -348,6 +399,8 @@ class PaperTradingRunner:
         status = trade["status"]
         last_ts: Optional[int] = trade.get("last_candle_ts")
         last_price: Optional[float] = trade.get("last_price")
+        worst: Optional[float] = trade.get("mae")
+        best: Optional[float] = trade.get("mfe")
 
         for candle in candles.to_dict("records"):
             ts = int(candle["ts"])
@@ -374,6 +427,7 @@ class PaperTradingRunner:
                     status = PAPER_OPEN
                     trade["status"] = PAPER_OPEN
                     trade["entry_price"] = float(trade["entry"])
+                    worst = best = 0.0
                     self._event(result, trade, "ENTRY_OPENED", price=float(trade["entry"]),
                                 candle_ts=ts, reason="entry level traded")
                     result.opened += 1
@@ -384,6 +438,10 @@ class PaperTradingRunner:
 
             if status != PAPER_OPEN:
                 continue
+            mae, mfe = self._excursion(trade, candle)
+            if mae is not None:
+                worst = max(worst or 0.0, mae)
+                best = max(best or 0.0, mfe)
             event = exit_event(trade, candle)
             if event is None:
                 continue
@@ -399,6 +457,7 @@ class PaperTradingRunner:
                 int(trade["id"]), outcome=event["outcome"], exit_price=event["exit_price"],
                 rr_achieved=event["rr_achieved"], close_reason=event["reason"],
                 closed_ts=ts, last_candle_ts=ts, last_price=float(candle["close"]),
+                mae=worst, mfe=best,
             ):
                 note = (f"paper runner {event['reason']} at {event['exit_price']:,.8g}; "
                         f"outcome {event['outcome']} ({event['rr_achieved']:+.2f}R)")
@@ -415,7 +474,8 @@ class PaperTradingRunner:
             return
 
         self.db.touch_paper_trade(int(trade["id"]), last_candle_ts=last_ts,
-                                  last_price=last_price, checked_ts=self.clock_ms())
+                                  last_price=last_price, checked_ts=self.clock_ms(),
+                                  mae=worst, mfe=best)
 
     def run_once(self, symbol: Optional[str] = None, enroll: bool = True) -> PaperRun:
         """Enroll approved signals and evaluate every active paper position once."""

@@ -112,6 +112,21 @@ class LLMBrain:
         except (KeyError, IndexError, TypeError):
             return None
 
+    def complete(self, prompt: str, system: Optional[str] = None) -> Optional[str]:
+        """Direct text completion for arbitrary reasoning prompts."""
+        if not self.enabled:
+            return None
+        full_prompt = f"{system}\n\n{prompt}" if system else prompt
+        if self.provider in ("openai", "auto"):
+            res = self._call_openai(full_prompt)
+            if res:
+                return res.strip()
+        if self.provider in ("gemini", "auto"):
+            res = self._call_gemini(full_prompt)
+            if res:
+                return res.strip()
+        return None
+
     def generate(self, payload: dict) -> dict:
         """Returns {'provider': ..., 'narrative': str}. Never raises."""
         if self.enabled:
